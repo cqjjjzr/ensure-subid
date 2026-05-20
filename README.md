@@ -136,8 +136,10 @@ When run by PAM, `PAM_USER` takes precedence over the manual argument.
 
 ## Exit Behavior And Logging
 
-Failures are logged through syslog with the `LOG_AUTHPRIV` facility and the
-`ensure-subid` identity.
+Detailed failures are logged through syslog with the `LOG_AUTHPRIV` facility and
+the `ensure-subid` identity. Stderr only gets a generic failure message that
+points to syslog and states whether the helper is returning 0 because it is
+running in non-strict mode.
 
 By default, errors are treated as non-fatal: they are logged as warnings and the
 helper exits successfully. Passing `--strict` makes errors produce a non-zero

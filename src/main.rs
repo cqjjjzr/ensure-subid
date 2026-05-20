@@ -30,13 +30,23 @@ fn main() {
 
         Ok(Err(e)) => {
             log_warning(&format!("non-fatal error: {e}"));
+            print_failure(strict);
             process::exit(if strict { 1 } else { 0 });
         }
 
         Err(_) => {
             log_warning("panic caught; treating as non-fatal");
+            print_failure(strict);
             process::exit(if strict { 101 } else { 0 });
         }
+    }
+}
+
+fn print_failure(strict: bool) {
+    if strict {
+        eprintln!("ensure-subid: failed; see syslog; returning non-zero due to strict settings");
+    } else {
+        eprintln!("ensure-subid: failed; see syslog; returning 0 due to non-strict settings");
     }
 }
 
