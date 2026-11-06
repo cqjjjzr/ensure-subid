@@ -1,49 +1,39 @@
 use std::{
     ffi::OsString,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Write},
-    os::unix::ffi::OsStrExt,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process,
-    sync::atomic::{AtomicU64, Ordering},
-    thread,
-    time::Duration,
+    process, thread,
+    time::{Duration, Instant},
 };
 
-use crate::error::{boxed, Result};
+use crate::{
+    atomic_file::{open_regular_file, sync_parent_directory},
+    error::Result,
+};
 
-const LOCK_TRIES: usize = 15;
-const LOCK_SLEEP: Duration = Duration::from_secs(1);
+// Preserve the previous wait budget: 14 sleeps between 15 attempts.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(14);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const LOCK_PID_MAX_BYTES: usize = 64;
-static TEMP_LOCK_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub(crate) struct ShadowLocks {
-    locks: Vec<ShadowLock>,
+    // Fields drop in declaration order, reversing the acquisition order.
+    _subgid: ShadowLock,
+    _subuid: ShadowLock,
 }
 
 impl ShadowLocks {
-    pub(crate) fn acquire(paths: &[&Path]) -> Result<Self> {
-        let mut ordered_paths = paths.to_vec();
-        ordered_paths.sort_by(|a, b| a.as_os_str().as_bytes().cmp(b.as_os_str().as_bytes()));
-        ordered_paths.dedup_by(|a, b| a.as_os_str().as_bytes() == b.as_os_str().as_bytes());
-
-        let mut locks = Vec::with_capacity(ordered_paths.len());
-
-        for path in ordered_paths {
-            locks.push(ShadowLock::acquire(path)?);
-        }
-
-        Ok(Self { locks })
-    }
-}
-
-impl Drop for ShadowLocks {
-    fn drop(&mut self) {
-        while let Some(lock) = self.locks.pop() {
-            drop(lock);
-        }
+    pub(crate) fn acquire(subuid: &Path, subgid: &Path) -> Result<Self> {
+        // Match shadow-utils: subuid first, then subgid (not alphabetical order).
+        let subuid = ShadowLock::acquire(subuid)?;
+        let subgid = ShadowLock::acquire(subgid)?;
+        Ok(Self {
+            _subgid: subgid,
+            _subuid: subuid,
+        })
     }
 }
 
@@ -55,21 +45,16 @@ struct ShadowLock {
 
 impl ShadowLock {
     fn acquire(path: &Path) -> Result<Self> {
-        Self::acquire_with_retry(path, LOCK_TRIES, LOCK_SLEEP)
+        Self::acquire_with_timeout(path, LOCK_TIMEOUT)
     }
 
-    fn acquire_with_retry(path: &Path, tries: usize, sleep: Duration) -> Result<Self> {
+    fn acquire_with_timeout(path: &Path, timeout: Duration) -> Result<Self> {
         let lock_path = append_to_path(path, ".lock");
-        let mut last_conflict = None;
+        let deadline = Instant::now() + timeout;
 
-        for attempt in 0..tries {
-            if attempt > 0 {
-                thread::sleep(sleep);
-            }
-
-            let temp_path = temp_lock_path(path);
-
-            match try_lock_once(&temp_path, &lock_path) {
+        // Always make an initial attempt, including for a zero timeout.
+        loop {
+            match try_lock_once(&lock_path) {
                 Ok(lock_file) => {
                     return Ok(Self {
                         lock_path,
@@ -77,22 +62,19 @@ impl ShadowLock {
                     })
                 }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    last_conflict = Some(e);
-                    continue;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(Box::new(e));
+                    }
+                    thread::sleep(LOCK_RETRY_INTERVAL.min(remaining));
+                    // Scheduling may delay waking; do not start a retry after expiry.
+                    if Instant::now() >= deadline {
+                        return Err(Box::new(e));
+                    }
                 }
                 Err(e) => return Err(Box::new(e)),
             }
         }
-
-        if let Some(e) = last_conflict {
-            return Err(Box::new(e));
-        }
-
-        Err(boxed(format!(
-            "failed to lock {} after {} attempts",
-            lock_path.display(),
-            tries
-        )))
     }
 }
 
@@ -104,13 +86,16 @@ impl Drop for ShadowLock {
     }
 }
 
-fn try_lock_once(temp_path: &Path, lock_path: &Path) -> io::Result<File> {
-    let lock_file = write_pid_file(temp_path)?;
+fn try_lock_once(lock_path: &Path) -> io::Result<File> {
+    let parent = lock_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    write!(temp, "{}\0", process::id())?;
+    temp.as_file().sync_data()?;
 
-    match fs::hard_link(temp_path, lock_path) {
+    match fs::hard_link(temp.path(), lock_path) {
         Ok(()) => {
-            let locked = check_link_count(&lock_file);
-            let _ = fs::remove_file(temp_path);
+            let locked = check_link_count(temp.as_file());
+            let lock_file = temp.into_file();
 
             if locked? {
                 if let Err(e) = sync_parent_directory(lock_path) {
@@ -128,8 +113,6 @@ fn try_lock_once(temp_path: &Path, lock_path: &Path) -> io::Result<File> {
         }
 
         Err(link_error) => {
-            let _ = fs::remove_file(temp_path);
-
             if link_error.kind() != io::ErrorKind::AlreadyExists {
                 return Err(link_error);
             }
@@ -137,19 +120,6 @@ fn try_lock_once(temp_path: &Path, lock_path: &Path) -> io::Result<File> {
             existing_lock_error(lock_path)
         }
     }
-}
-
-fn write_pid_file(path: &Path) -> io::Result<File> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?;
-
-    write!(file, "{}\0", process::id())?;
-    file.sync_data()?;
-    Ok(file)
 }
 
 fn check_link_count(file: &File) -> io::Result<bool> {
@@ -174,10 +144,7 @@ fn existing_lock_error(lock_path: &Path) -> io::Result<File> {
 }
 
 fn read_lock_pid(path: &Path) -> io::Result<i32> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?;
+    let file = open_regular_file(path)?;
     let mut contents = Vec::new();
     let mut limited = file.take(LOCK_PID_MAX_BYTES as u64 + 1);
     limited.read_to_end(&mut contents)?;
@@ -229,24 +196,6 @@ fn append_to_path(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-fn temp_lock_path(path: &Path) -> PathBuf {
-    let nonce = TEMP_LOCK_NONCE.fetch_add(1, Ordering::Relaxed);
-    append_to_path(path, &format!(".{}.{}", process::id(), nonce))
-}
-
-fn sync_parent_directory(path: &Path) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
-        .open(parent)?;
-
-    dir.sync_all()
-}
-
 fn remove_lock_if_owned(path: &Path, file: &File) -> io::Result<bool> {
     let file_meta = file.metadata()?;
     let path_meta = match fs::symlink_metadata(path) {
@@ -270,157 +219,158 @@ fn remove_lock_if_owned(path: &Path, file: &File) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_support::{assert_error, isolated, make_fifo};
+    use std::os::unix::fs::{symlink, FileTypeExt};
 
-    struct TestDir {
-        path: PathBuf,
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
+    #[test]
+    fn lock_pair_writes_pid_excludes_contenders_and_cleans_up() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let subuid = dir.path().join("subuid");
+        let subgid = dir.path().join("subgid");
+        let locks = ShadowLocks::acquire(&subuid, &subgid)?;
+        for path in [&subuid, &subgid] {
+            assert_eq!(
+                fs::read(append_to_path(path, ".lock"))?,
+                format!("{}\0", process::id()).as_bytes()
+            );
+            let error = ShadowLock::acquire_with_timeout(path, Duration::ZERO).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::AlreadyExists
+            );
         }
-    }
-
-    fn test_dir(name: &str) -> Result<TestDir> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("ensure-subid-{name}-{}-{now}", process::id()));
-
-        fs::create_dir(&path)?;
-        Ok(TestDir { path })
+        assert_eq!(fs::read_dir(dir.path())?.count(), 2);
+        drop(locks);
+        assert_eq!(fs::read_dir(dir.path())?.count(), 0);
+        Ok(())
     }
 
     #[test]
-    fn shadow_lock_creates_and_removes_lock_file() -> Result<()> {
-        let dir = test_dir("shadow-lock")?;
-        let data = dir.path.join("data");
+    fn live_lock_honors_retry_deadline() -> Result<()> {
+        isolated("lock::tests::live_lock_honors_retry_deadline", || {
+            let dir = tempfile::tempdir()?;
+            let data = dir.path().join("data");
+            let _held = ShadowLock::acquire(&data)?;
+            let timeout = Duration::from_millis(150);
+            let start = Instant::now();
+            assert_error(
+                ShadowLock::acquire_with_timeout(&data, timeout),
+                "lock already held",
+            );
+            assert!(start.elapsed() >= timeout);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn existing_locks_are_never_removed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data = dir.path().join("data");
         let lock = append_to_path(&data, ".lock");
-
-        {
-            let _lock = ShadowLock::acquire(&data)?;
-            assert!(lock.exists());
+        for (contents, reason) in [
+            (
+                format!("{}\0", process::id()).into_bytes(),
+                "lock already held",
+            ),
+            (
+                format!("{}\n", process::id()).into_bytes(),
+                "lock already held",
+            ),
+            (b"999999999\0".to_vec(), "stale lock"),
+            (b"0\0".to_vec(), "must be positive"),
+            (b"-1\0".to_vec(), "must be positive"),
+            (vec![b'1'; LOCK_PID_MAX_BYTES + 1], "too large"),
+            (vec![], "no pid"),
+            (vec![0xff], "not UTF-8"),
+        ] {
+            fs::write(&lock, &contents)?;
+            assert_error(
+                ShadowLock::acquire_with_timeout(&data, Duration::ZERO),
+                reason,
+            );
+            assert_eq!(fs::read(&lock)?, contents);
+            assert_eq!(fs::read_dir(dir.path())?.count(), 1);
         }
-
-        assert!(!lock.exists());
         Ok(())
     }
 
     #[test]
-    fn shadow_lock_refuses_live_lock() -> Result<()> {
-        let dir = test_dir("shadow-lock-live")?;
-        let data = dir.path.join("data");
-        let _lock = ShadowLock::acquire(&data)?;
+    fn unsafe_second_lock_releases_first_without_blocking() -> Result<()> {
+        isolated(
+            "lock::tests::unsafe_second_lock_releases_first_without_blocking",
+            || {
+                let dir = tempfile::tempdir()?;
+                let first = dir.path().join("subuid");
+                let second = dir.path().join("subgid");
+                let lock = append_to_path(&second, ".lock");
+                let target = dir.path().join("target");
+                fs::write(&target, format!("{}\0", process::id()))?;
+                for kind in ["symlink", "directory", "fifo"] {
+                    match kind {
+                        "symlink" => symlink(&target, &lock)?,
+                        "directory" => fs::create_dir(&lock)?,
+                        _ => make_fifo(&lock)?,
+                    }
+                    let reason = if kind == "symlink" {
+                        "refusing symlink"
+                    } else {
+                        "not a regular file"
+                    };
+                    assert_error(ShadowLocks::acquire(&first, &second), reason);
+                    assert!(!append_to_path(&first, ".lock").exists());
+                    let file_type = fs::symlink_metadata(&lock)?.file_type();
+                    match kind {
+                        "symlink" => assert!(file_type.is_symlink()),
+                        "directory" => assert!(file_type.is_dir()),
+                        _ => assert!(file_type.is_fifo()),
+                    }
+                    assert_eq!(fs::read_dir(dir.path())?.count(), 2);
+                    if kind == "directory" {
+                        fs::remove_dir(&lock)?;
+                    } else {
+                        fs::remove_file(&lock)?;
+                    }
+                }
+                assert_eq!(fs::read(target)?, format!("{}\0", process::id()).as_bytes());
+                Ok(())
+            },
+        )
+    }
 
-        let err = ShadowLock::acquire_with_retry(&data, 1, Duration::from_secs(0))
-            .expect_err("expected lock conflict");
-
-        assert_eq!(
-            err.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(io::ErrorKind::AlreadyExists)
+    #[test]
+    fn subuid_is_attempted_before_subgid() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let subuid = dir.path().join("subuid");
+        let subgid = dir.path().join("subgid");
+        // Distinct immediate errors reveal which path is attempted first.
+        fs::write(append_to_path(&subuid, ".lock"), b"0\0")?;
+        fs::create_dir(append_to_path(&subgid, ".lock"))?;
+        assert_error(
+            ShadowLocks::acquire(&subuid, &subgid),
+            "lock pid must be positive",
         );
+        assert_eq!(fs::read_dir(dir.path())?.count(), 2);
         Ok(())
     }
 
     #[test]
-    fn shadow_lock_drop_does_not_remove_replaced_lock_path() -> Result<()> {
-        let dir = test_dir("shadow-lock-replaced")?;
-        let data = dir.path.join("data");
-        let lock_path = append_to_path(&data, ".lock");
+    fn drop_preserves_a_replacement_lock() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data = dir.path().join("data");
+        let path = append_to_path(&data, ".lock");
         let lock = ShadowLock::acquire(&data)?;
-
-        fs::remove_file(&lock_path)?;
-        fs::write(&lock_path, b"12345\0")?;
-
+        fs::remove_file(&path)?;
+        fs::write(&path, b"12345\0")?;
         drop(lock);
-
-        assert_eq!(fs::read(&lock_path)?, b"12345\0");
+        assert_eq!(fs::read(&path)?, b"12345\0");
         Ok(())
     }
 
     #[test]
-    fn shadow_lock_refuses_stale_lock_without_removing_it() -> Result<()> {
-        let dir = test_dir("shadow-lock-stale")?;
-        let data = dir.path.join("data");
-        let lock = append_to_path(&data, ".lock");
-        fs::write(&lock, b"999999999\0")?;
-
-        let err = ShadowLock::acquire_with_retry(&data, 2, Duration::from_secs(0))
-            .expect_err("expected stale lock conflict");
-
-        let err = err.downcast_ref::<io::Error>().expect("expected io error");
-        assert_eq!(err.kind(), io::ErrorKind::Other);
-        assert!(
-            err.to_string().contains("stale lock held by dead pid"),
-            "unexpected error: {err}"
-        );
-        assert!(lock.exists());
-        assert_eq!(fs::read(&lock)?, b"999999999\0");
-        Ok(())
-    }
-
-    #[test]
-    fn missing_existing_lock_is_retryable() -> Result<()> {
-        let dir = test_dir("shadow-lock-missing")?;
-        let lock = dir.path.join("data.lock");
-
-        let err = existing_lock_error(&lock).expect_err("expected retryable missing lock");
-
-        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
-        Ok(())
-    }
-
-    #[test]
-    fn read_lock_pid_rejects_non_positive_and_overlong_values() -> Result<()> {
-        let dir = test_dir("shadow-lock-pid-parse")?;
-        let lock = dir.path.join("data.lock");
-
-        fs::write(&lock, b"0\0")?;
-        assert_eq!(
-            read_lock_pid(&lock)
-                .expect_err("expected zero pid rejection")
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        fs::write(&lock, b"-1\0")?;
-        assert_eq!(
-            read_lock_pid(&lock)
-                .expect_err("expected negative pid rejection")
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        fs::write(&lock, vec![b'1'; LOCK_PID_MAX_BYTES + 1])?;
-        assert_eq!(
-            read_lock_pid(&lock)
-                .expect_err("expected overlong pid rejection")
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn shadow_locks_acquires_in_canonical_order_and_deduplicates() -> Result<()> {
-        let dir = test_dir("shadow-lock-order")?;
-        let data_a = dir.path.join("a");
-        let data_b = dir.path.join("b");
-        let lock_a = append_to_path(&data_a, ".lock");
-        let lock_b = append_to_path(&data_b, ".lock");
-
-        {
-            let _locks = ShadowLocks::acquire(&[&data_b, &data_a, &data_b])?;
-            assert!(lock_a.exists());
-            assert!(lock_b.exists());
-        }
-
-        assert!(!lock_a.exists());
-        assert!(!lock_b.exists());
+    fn vanished_lock_is_retryable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let error = existing_lock_error(&dir.path().join("missing.lock")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         Ok(())
     }
 }

@@ -171,58 +171,39 @@ pub(crate) fn should_manage_account(account: &Account) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn account(name: &str, uid: u64, gid: u64) -> Account {
-        Account {
-            name: name.to_string(),
-            uid,
-            gid,
-        }
-    }
-
-    fn assert_error_contains(result: Result<()>, needle: &str) {
-        let error = result.expect_err("expected an error");
-        assert!(
-            error.to_string().contains(needle),
-            "expected error to contain {needle:?}, got {error}"
-        );
-    }
+    use crate::test_support::assert_error;
 
     #[test]
-    fn validate_username_rejects_subid_separators_and_nul() {
-        for (name, expected) in [
+    fn usernames_reject_subid_separators_and_nul() {
+        for (name, reason) in [
             ("bad:name", "contains ':'"),
             ("bad\nname", "contains newline"),
             ("bad\0name", "contains NUL byte"),
         ] {
-            assert_error_contains(validate_username(name, "username"), expected);
+            assert_error(validate_username(name, "username"), reason);
         }
-
         assert!(validate_username("alice", "username").is_ok());
     }
 
     #[test]
-    fn should_manage_account_skips_system_users_and_rejects_pool_overlap() -> Result<()> {
-        assert!(!should_manage_account(&account(
-            "rootish",
-            MIN_MANAGED_UID - 1,
-            100
-        ))?);
-        assert!(should_manage_account(&account(
-            "alice",
-            MIN_MANAGED_UID,
-            MIN_MANAGED_UID
-        ))?);
-
-        assert_error_contains(
-            should_manage_account(&account("alice", POOL_START, MIN_MANAGED_UID)).map(|_| ()),
-            "overlaps subordinate pool",
-        );
-        assert_error_contains(
-            should_manage_account(&account("alice", MIN_MANAGED_UID, POOL_START)).map(|_| ()),
-            "overlaps subordinate pool",
-        );
-
-        Ok(())
+    fn account_eligibility_checks_id_boundaries() {
+        for (uid, gid, expected) in [
+            (MIN_MANAGED_UID - 1, 100, Some(false)),
+            (MIN_MANAGED_UID, MIN_MANAGED_UID, Some(true)),
+            (POOL_START - 1, POOL_START - 1, Some(true)),
+            (POOL_START, MIN_MANAGED_UID, None),
+            (MIN_MANAGED_UID, POOL_START, None),
+        ] {
+            let account = Account {
+                name: "alice".into(),
+                uid,
+                gid,
+            };
+            assert_eq!(
+                should_manage_account(&account).ok(),
+                expected,
+                "{account:?}"
+            );
+        }
     }
 }

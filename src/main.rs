@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod test_support;
+
 mod account;
 mod atomic_file;
 mod error;
@@ -13,9 +16,7 @@ use atomic_file::{atomic_replace_locked, ensure_regular_file, read_regular_file}
 use error::Result;
 use lock::ShadowLocks;
 use log::log_warning;
-use subid::{
-    append_entries, parse_entries, plan_subid_updates, validate_constants, PlannedEntry, SubidFile,
-};
+use subid::{append_entries, parse_entries, plan_subid_updates, PlannedEntry, SubidFile};
 
 const SUBUID_PATH: &str = "/etc/subuid";
 const SUBGID_PATH: &str = "/etc/subgid";
@@ -23,21 +24,29 @@ const SUBGID_PATH: &str = "/etc/subgid";
 fn main() {
     let strict = env::args_os().any(|a| a == "--strict");
 
-    let result = std::panic::catch_unwind(run);
+    process::exit(finish_run(std::panic::catch_unwind(run), strict));
+}
 
+fn finish_run(result: std::thread::Result<Result<()>>, strict: bool) -> i32 {
     match result {
-        Ok(Ok(())) => process::exit(0),
-
+        Ok(Ok(())) => 0,
         Ok(Err(e)) => {
-            log_warning(&format!("non-fatal error: {e}"));
+            log_warning(&format!("setup failed: {e}"));
             print_failure(strict);
-            process::exit(if strict { 1 } else { 0 });
+            if strict {
+                1
+            } else {
+                0
+            }
         }
-
         Err(_) => {
-            log_warning("panic caught; treating as non-fatal");
+            log_warning("panic caught during setup");
             print_failure(strict);
-            process::exit(if strict { 101 } else { 0 });
+            if strict {
+                101
+            } else {
+                0
+            }
         }
     }
 }
@@ -51,8 +60,6 @@ fn print_failure(strict: bool) {
 }
 
 fn run() -> Result<()> {
-    validate_constants()?;
-
     /*
      * If run by pam_exec with type=open_session, this is redundant.
      * It makes accidental execution on close_session harmless.
@@ -75,7 +82,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let _locks = ShadowLocks::acquire(&[Path::new(SUBUID_PATH), Path::new(SUBGID_PATH)])?;
+    let _locks = ShadowLocks::acquire(Path::new(SUBUID_PATH), Path::new(SUBGID_PATH))?;
 
     ensure_regular_file(Path::new(SUBUID_PATH), 0o644)?;
     ensure_regular_file(Path::new(SUBGID_PATH), 0o644)?;
@@ -119,4 +126,24 @@ fn apply_updates(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_status_follows_strict_policy() {
+        for strict in [false, true] {
+            assert_eq!(finish_run(Ok(Ok(())), strict), 0);
+            assert_eq!(
+                finish_run(Ok(Err(error::boxed("test setup failure"))), strict),
+                if strict { 1 } else { 0 }
+            );
+            assert_eq!(
+                finish_run(Err(Box::new("test panic")), strict),
+                if strict { 101 } else { 0 }
+            );
+        }
+    }
 }

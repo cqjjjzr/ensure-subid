@@ -24,35 +24,6 @@ pub(crate) struct PlannedEntry {
     pub(crate) count: u64,
 }
 
-pub(crate) fn validate_constants() -> Result<()> {
-    if RANGE_SIZE == 0 {
-        return Err(boxed("RANGE_SIZE must not be zero"));
-    }
-
-    if POOL_START >= POOL_END_EXCLUSIVE {
-        return Err(boxed("POOL_START must be below POOL_END_EXCLUSIVE"));
-    }
-
-    if POOL_END_EXCLUSIVE > UID_SPACE_END {
-        return Err(boxed("pool exceeds 32-bit uid/gid space"));
-    }
-
-    if POOL_END_EXCLUSIVE - POOL_START < RANGE_SIZE {
-        return Err(boxed("pool is smaller than one subordinate range"));
-    }
-
-    let slots = (POOL_END_EXCLUSIVE - POOL_START) / RANGE_SIZE;
-    if !slots.is_power_of_two() {
-        return Err(boxed("subordinate range slot count must be a power of two"));
-    }
-
-    if !POOL_START.is_multiple_of(RANGE_SIZE) {
-        return Err(boxed("POOL_START should be aligned to RANGE_SIZE"));
-    }
-
-    Ok(())
-}
-
 pub(crate) fn parse_entries(path_name: &str, contents: &[u8]) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
 
@@ -71,48 +42,48 @@ pub(crate) fn plan_subid_updates(
     subuid_entries: &[Entry],
     subgid_entries: &[Entry],
 ) -> Result<Vec<PlannedEntry>> {
-    let mut owner_keys = vec![account.name.clone(), requested_user.to_string()];
-    owner_keys.sort();
-    owner_keys.dedup();
+    let owner_keys = [account.name.as_str(), requested_user];
 
     let subuid_existing = owned_ranges(subuid_entries, &owner_keys);
     let subgid_existing = owned_ranges(subgid_entries, &owner_keys);
 
-    /*
-     * If both files already configure any subordinate space for the user, leave
-     * it alone. Existing ranges do not have to match each other or the current
-     * hash preference.
-     */
-    if !subuid_existing.is_empty() && !subgid_existing.is_empty() {
-        return Ok(Vec::new());
-    }
-
     match (subuid_existing.as_slice(), subgid_existing.as_slice()) {
-        (ranges, []) if ranges_exceed_slot(ranges) => Ok(Vec::new()),
-
-        ([], ranges) if ranges_exceed_slot(ranges) => Ok(Vec::new()),
-
-        (ranges, []) if !ranges.is_empty() && ranges_available(subgid_entries, ranges) => {
-            Ok(mirror_updates(SubidFile::Gid, ranges))
-        }
-
-        ([], ranges) if !ranges.is_empty() && ranges_available(subuid_entries, ranges) => {
-            Ok(mirror_updates(SubidFile::Uid, ranges))
-        }
-
         ([], []) => {
             /*
              * New allocation. The chosen slot must be free in both files.
-             * We use the same numeric start for UID and GID subranges. UID
-             * and GID spaces are separate, so this is not a conflict; it just
-             * makes auditing easier.
+             * UID and GID spaces are separate; matching numbers simplify auditing.
              */
             let start = choose_range(account, subuid_entries, subgid_entries)?;
             Ok(paired_updates(start))
         }
-
+        (ranges, []) => plan_mirror(SubidFile::Gid, ranges, subgid_entries),
+        ([], ranges) => plan_mirror(SubidFile::Uid, ranges, subuid_entries),
+        // Both sides are configured. Preserve existing ranges even if they
+        // differ from each other or the current allocation policy.
         _ => Ok(Vec::new()),
     }
+}
+
+fn plan_mirror(file: SubidFile, ranges: &[Entry], target: &[Entry]) -> Result<Vec<PlannedEntry>> {
+    let path = match file {
+        SubidFile::Uid => "/etc/subuid",
+        SubidFile::Gid => "/etc/subgid",
+    };
+    if ranges_exceed_slot(ranges) {
+        return Err(boxed(format!(
+            "{path}: cannot repair missing ranges: a source range exceeds {RANGE_SIZE} IDs; manual repair required"
+        )));
+    }
+    if !ranges_available(target, ranges) {
+        return Err(boxed(format!(
+            "{path}: cannot repair missing ranges: a source range overlaps an existing target allocation; manual repair required"
+        )));
+    }
+
+    // Legacy mirroring deliberately allows ranges outside the generated pool.
+    // Administrators must reserve those numbers in BOTH UID and GID spaces;
+    // absence from the target subid file is not proof of that reservation.
+    Ok(mirror_updates(file, ranges))
 }
 
 pub(crate) fn append_entries(old_contents: &[u8], owner: &str, ranges: &[(u64, u64)]) -> Vec<u8> {
@@ -136,7 +107,7 @@ pub(crate) fn append_entries(old_contents: &[u8], owner: &str, ranges: &[(u64, u
 }
 
 fn parse_entry(path_name: &str, line_no: usize, raw: &[u8]) -> Result<Option<Entry>> {
-    let line = trim_ascii(raw);
+    let line = raw.trim_ascii();
 
     if line.is_empty() || line.starts_with(b"#") {
         return Ok(None);
@@ -184,20 +155,6 @@ fn parse_u64_field(path_name: &str, line_no: usize, bytes: &[u8], field: &str) -
         .map_err(|_| boxed(format!("{path_name}:{line_no}: invalid {field}")))
 }
 
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map(|idx| idx + 1)
-        .unwrap_or(start);
-
-    &bytes[start..end]
-}
-
 fn paired_updates(start: u64) -> Vec<PlannedEntry> {
     vec![
         PlannedEntry {
@@ -228,7 +185,7 @@ fn mirror_updates(file: SubidFile, ranges: &[Entry]) -> Vec<PlannedEntry> {
         .collect()
 }
 
-fn owned_ranges(entries: &[Entry], owner_keys: &[String]) -> Vec<Entry> {
+fn owned_ranges(entries: &[Entry], owner_keys: &[&str]) -> Vec<Entry> {
     entries
         .iter()
         .filter(|e| owned_range(e, owner_keys))
@@ -236,12 +193,11 @@ fn owned_ranges(entries: &[Entry], owner_keys: &[String]) -> Vec<Entry> {
         .collect()
 }
 
-fn owned_range(entry: &Entry, owner_keys: &[String]) -> bool {
+fn owned_range(entry: &Entry, owner_keys: &[&str]) -> bool {
     entry
         .owner
-        .as_ref()
-        .map(|owner| owner_keys.iter().any(|k| k == owner))
-        .unwrap_or(false)
+        .as_deref()
+        .is_some_and(|owner| owner_keys.contains(&owner))
 }
 
 fn ranges_available(entries: &[Entry], ranges: &[Entry]) -> bool {
@@ -260,10 +216,6 @@ fn choose_range(
     subgid_entries: &[Entry],
 ) -> Result<u64> {
     let slots = (POOL_END_EXCLUSIVE - POOL_START) / RANGE_SIZE;
-
-    if slots == 0 {
-        return Err(boxed("no slots available"));
-    }
 
     /*
      * Stable hash key. We write username owners, but keep allocation
@@ -330,85 +282,57 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::assert_error;
+
+    fn account() -> Account {
+        Account {
+            name: "alice".into(),
+            uid: 1_234_567,
+            gid: 1_234_567,
+        }
+    }
 
     fn entry(owner: &str, start: u64, count: u64) -> Entry {
         Entry {
-            owner: Some(owner.to_string()),
+            owner: Some(owner.into()),
             start,
             count,
         }
     }
 
-    fn account(name: &str, uid: u64, gid: u64) -> Account {
-        Account {
-            name: name.to_string(),
-            uid,
-            gid,
-        }
-    }
-
-    fn assert_error_contains(result: Result<()>, needle: &str) {
-        let error = result.expect_err("expected an error");
-        assert!(
-            error.to_string().contains(needle),
-            "expected error to contain {needle:?}, got {error}"
-        );
+    fn plan(uids: &[Entry], gids: &[Entry]) -> Result<Vec<(SubidFile, u64, u64)>> {
+        Ok(plan_subid_updates(&account(), "alias", uids, gids)?
+            .into_iter()
+            .map(|e| (e.file, e.start, e.count))
+            .collect())
     }
 
     #[test]
-    fn probe_slot_uses_full_cycle_quadratic_order() {
-        let slots = 16;
-        let preferred = 5;
-        let sequence: Vec<u64> = (0..slots)
-            .map(|probe| probe_slot(preferred, probe, slots))
-            .collect();
-        let mut sorted = sequence.clone();
-        sorted.sort_unstable();
-
-        assert_eq!(sequence[..5], [5, 6, 8, 11, 15]);
-        assert_eq!(sorted, (0..slots).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn parse_entries_accepts_comments_blank_lines_and_whitespace() -> Result<()> {
-        let second_start = POOL_START + RANGE_SIZE;
+    fn parsing_preserves_ranges_and_tolerates_non_utf8_owners() -> Result<()> {
         let entries = parse_entries(
-            "/tmp/subuid",
-            format!(
-                "\n# managed elsewhere\n  alice:{POOL_START}:{RANGE_SIZE}  \n1001:{second_start}:{}\n",
-                RANGE_SIZE * 2
-            )
-            .as_bytes(),
+            "subuid",
+            b"\n # comment\n alice:100:2 \n1001:200:3\n\xffuser:300:4\nlast:4294967295:1\n",
         )?;
-
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].owner.as_deref(), Some("alice"));
-        assert_eq!(entries[0].start, POOL_START);
-        assert_eq!(entries[0].count, RANGE_SIZE);
-        assert_eq!(entries[1].owner.as_deref(), Some("1001"));
-        assert_eq!(entries[1].start, second_start);
-        assert_eq!(entries[1].count, RANGE_SIZE * 2);
-
+        let fields: Vec<_> = entries
+            .iter()
+            .map(|e| (e.owner.as_deref(), e.start, e.count))
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                (Some("alice"), 100, 2),
+                (Some("1001"), 200, 3),
+                (None, 300, 4),
+                (Some("last"), UID_SPACE_END - 1, 1)
+            ]
+        );
+        assert!(!range_available(&entries, 300, 4));
         Ok(())
     }
 
     #[test]
-    fn parse_entries_allows_non_utf8_owners_while_reserving_ranges() -> Result<()> {
-        let entries = parse_entries("/tmp/subuid", b"\xffuser:1073741824:65536\n")?;
-
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].owner, None);
-        assert_eq!(entries[0].start, POOL_START);
-        assert_eq!(entries[0].count, RANGE_SIZE);
-        assert!(!owned_range(&entries[0], &["user".to_string()]));
-        assert!(!range_available(&entries, POOL_START, RANGE_SIZE));
-
-        Ok(())
-    }
-
-    #[test]
-    fn parse_entries_rejects_malformed_lines() {
-        let cases = [
+    fn malformed_entries_report_file_line_and_reason() {
+        for (line, reason) in [
             ("alice:1", "invalid field count"),
             (":1:1", "empty owner"),
             ("alice:nope:1", "invalid start id"),
@@ -416,18 +340,32 @@ mod tests {
             ("alice:1:0", "zero count"),
             ("alice:18446744073709551615:2", "range overflow"),
             ("alice:4294967295:2", "range exceeds 32-bit uid/gid space"),
-        ];
-
-        for (text, expected) in cases {
-            assert_error_contains(
-                parse_entries("/tmp/subuid", text.as_bytes()).map(|_| ()),
-                expected,
+        ] {
+            assert_error(
+                parse_entries("subuid", format!("# comment\n{line}").as_bytes()),
+                &format!("subuid:2: {reason}"),
             );
         }
     }
 
     #[test]
-    fn ranges_overlap_handles_boundaries_and_overflow() {
+    fn appended_ranges_preserve_old_bytes_and_newline_boundaries() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"", b""),
+            (b"root:0:1", b"root:0:1\n"),
+            (b"root:0:1\n", b"root:0:1\n"),
+            (b"\xff:0:1", b"\xff:0:1\n"),
+        ];
+        for &(old, prefix) in cases {
+            assert_eq!(
+                append_entries(old, "alice", &[(100, 2), (200, 3)]),
+                [prefix, b"alice:100:2\nalice:200:3\n"].concat()
+            );
+        }
+    }
+
+    #[test]
+    fn overlap_checks_boundaries_and_overflow() {
         assert!(ranges_overlap(10, 5, 14, 5));
         assert!(ranges_overlap(10, 5, 5, 6));
         assert!(!ranges_overlap(10, 5, 15, 5));
@@ -437,327 +375,157 @@ mod tests {
     }
 
     #[test]
-    fn range_available_rejects_any_overlap() {
-        let entries = [
-            entry("one", 1_000, 100),
-            entry("two", 2_000, 100),
-            entry("three", 3_000, 100),
-        ];
-
-        assert!(range_available(&entries, 1_100, 900));
-        assert!(!range_available(&entries, 1_050, 10));
-        assert!(!range_available(&entries, 1_900, 200));
+    fn quadratic_probes_visit_every_slot() {
+        let sequence: Vec<_> = (0..16).map(|probe| probe_slot(5, probe, 16)).collect();
+        assert_eq!(sequence[..5], [5, 6, 8, 11, 15]);
+        let mut sorted = sequence;
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..16).collect::<Vec<_>>());
     }
 
     #[test]
-    fn owned_ranges_matches_any_owner_key() {
-        let entries = [
-            entry("alice", POOL_START, RANGE_SIZE - 1),
-            entry("1001", POOL_START + RANGE_SIZE, RANGE_SIZE),
-            entry("alice", POOL_START + RANGE_SIZE * 2, RANGE_SIZE),
-        ];
-        let owner_keys = vec!["alice".to_string(), "1001".to_string()];
-
-        let found = owned_ranges(&entries, &owner_keys);
-
-        assert_eq!(found.len(), 3);
-        assert_eq!(found[0].owner.as_deref(), Some("alice"));
-        assert_eq!(found[1].owner.as_deref(), Some("1001"));
-        assert_eq!(found[2].owner.as_deref(), Some("alice"));
-    }
-
-    #[test]
-    fn append_entries_adds_separator_when_existing_contents_lack_trailing_newline() {
-        let contents = append_entries(b"root:0:1", "alice", &[(POOL_START, RANGE_SIZE)]);
-
-        assert_eq!(
-            contents,
-            format!("root:0:1\nalice:{POOL_START}:{RANGE_SIZE}\n").into_bytes()
-        );
-    }
-
-    #[test]
-    fn append_entries_does_not_add_extra_separator_after_trailing_newline() {
-        let contents = append_entries(b"root:0:1\n", "alice", &[(POOL_START, RANGE_SIZE)]);
-
-        assert_eq!(
-            contents,
-            format!("root:0:1\nalice:{POOL_START}:{RANGE_SIZE}\n").into_bytes()
-        );
-    }
-
-    #[test]
-    fn append_entries_appends_multiple_ranges_in_order() {
-        let contents = append_entries(
-            b"",
-            "alice",
-            &[
-                (POOL_START, RANGE_SIZE),
-                (POOL_START + RANGE_SIZE * 2, RANGE_SIZE),
-            ],
-        );
-
-        assert_eq!(
-            contents,
-            format!(
-                "alice:{POOL_START}:{RANGE_SIZE}\nalice:{}:{RANGE_SIZE}\n",
-                POOL_START + RANGE_SIZE * 2
-            )
-            .into_bytes()
-        );
-    }
-
-    #[test]
-    fn choose_range_is_stable_and_avoids_subuid_and_subgid_entries() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-
-        let preferred = choose_range(&account, &[], &[])?;
+    fn new_allocations_are_stable_paired_and_avoid_both_files() -> Result<()> {
+        let preferred = choose_range(&account(), &[], &[])?;
         assert_eq!(preferred % RANGE_SIZE, 0);
-        assert!(preferred >= POOL_START);
-        assert!(preferred + RANGE_SIZE <= POOL_END_EXCLUSIVE);
-        assert_eq!(choose_range(&account, &[], &[])?, preferred);
-
-        let subuid_taken = [entry("other", preferred, RANGE_SIZE)];
-        let after_subuid_collision = choose_range(&account, &subuid_taken, &[])?;
-        assert_ne!(after_subuid_collision, preferred);
-        assert!(range_available(
-            &subuid_taken,
-            after_subuid_collision,
-            RANGE_SIZE
-        ));
-
-        let slots = (POOL_END_EXCLUSIVE - POOL_START) / RANGE_SIZE;
-        let preferred_slot = (preferred - POOL_START) / RANGE_SIZE;
-        let next_linear_slot = POOL_START + probe_slot(preferred_slot, 1, slots) * RANGE_SIZE;
-        let next_quadratic_slot = POOL_START + probe_slot(preferred_slot, 2, slots) * RANGE_SIZE;
-        let linear_cluster = [
-            entry("other", preferred, RANGE_SIZE),
-            entry("other", next_linear_slot, RANGE_SIZE),
-        ];
-        let after_cluster = choose_range(&account, &linear_cluster, &[])?;
-        assert_eq!(after_cluster, next_quadratic_slot);
-
-        let subgid_taken = [entry("other", preferred, RANGE_SIZE)];
-        let after_subgid_collision = choose_range(&account, &[], &subgid_taken)?;
-        assert_ne!(after_subgid_collision, preferred);
-        assert!(range_available(
-            &subgid_taken,
-            after_subgid_collision,
-            RANGE_SIZE
-        ));
-
-        Ok(())
-    }
-
-    #[test]
-    fn plan_subid_updates_returns_no_writes_when_both_files_are_configured() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [entry("alice", POOL_START, RANGE_SIZE)];
-        let subgid_entries = [entry("alice", POOL_START + RANGE_SIZE, RANGE_SIZE)];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert!(updates.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn plan_subid_updates_ignores_numeric_uid_owned_entries_for_user_matching() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [entry("1234567", POOL_START, RANGE_SIZE)];
-        let subgid_entries = [entry("1234567", POOL_START + RANGE_SIZE, RANGE_SIZE)];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].file, SubidFile::Uid);
-        assert_eq!(updates[1].file, SubidFile::Gid);
-        assert_eq!(updates[0].start, updates[1].start);
-        assert!(range_available(
-            &subuid_entries,
-            updates[0].start,
-            updates[0].count
-        ));
-        assert!(range_available(
-            &subgid_entries,
-            updates[1].start,
-            updates[1].count
-        ));
-
-        Ok(())
-    }
-
-    #[test]
-    fn plan_subid_updates_returns_no_writes_when_both_files_have_multiple_ranges() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [
-            entry("alice", POOL_START, RANGE_SIZE),
-            entry("alice", POOL_START + RANGE_SIZE, RANGE_SIZE),
-        ];
-        let subgid_entries = [
-            entry("alice", POOL_START + RANGE_SIZE * 2, RANGE_SIZE),
-            entry("alice", POOL_START + RANGE_SIZE * 3, RANGE_SIZE),
-        ];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert!(updates.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn plan_subid_updates_mirrors_multiple_uid_ranges_to_missing_gid_side() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [
-            entry("alice", POOL_START, RANGE_SIZE),
-            entry("alice", POOL_START + RANGE_SIZE * 2, RANGE_SIZE),
-        ];
-        let subgid_entries = [entry("other", POOL_START + RANGE_SIZE * 5, RANGE_SIZE)];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].file, SubidFile::Gid);
-        assert_eq!(updates[1].file, SubidFile::Gid);
-        assert_eq!(updates[0].start, POOL_START);
-        assert_eq!(updates[0].count, RANGE_SIZE);
-        assert_eq!(updates[1].start, POOL_START + RANGE_SIZE * 2);
-        assert_eq!(updates[1].count, RANGE_SIZE);
-
-        Ok(())
-    }
-
-    #[test]
-    fn plan_subid_updates_mirrors_multiple_gid_ranges_to_missing_uid_side() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [entry("other", POOL_START + RANGE_SIZE * 5, RANGE_SIZE)];
-        let subgid_entries = [
-            entry("alice", POOL_START, RANGE_SIZE),
-            entry("alice", POOL_START + RANGE_SIZE * 2, RANGE_SIZE),
-        ];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].file, SubidFile::Uid);
-        assert_eq!(updates[1].file, SubidFile::Uid);
-        assert_eq!(updates[0].start, POOL_START);
-        assert_eq!(updates[0].count, RANGE_SIZE);
-        assert_eq!(updates[1].start, POOL_START + RANGE_SIZE * 2);
-        assert_eq!(updates[1].count, RANGE_SIZE);
-
-        Ok(())
-    }
-
-    #[test]
-    fn plan_subid_updates_repairs_missing_gid_with_existing_uid_range() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [entry("alice", POOL_START, RANGE_SIZE)];
-        let subgid_entries = [entry("other", POOL_START + RANGE_SIZE * 4, RANGE_SIZE)];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert_eq!(
-            updates,
-            vec![PlannedEntry {
-                file: SubidFile::Gid,
-                start: POOL_START,
-                count: RANGE_SIZE,
-            }]
+        assert!(preferred >= POOL_START && preferred + RANGE_SIZE <= POOL_END_EXCLUSIVE);
+        let renamed = Account {
+            name: "renamed".into(),
+            ..account()
+        };
+        assert_eq!(choose_range(&renamed, &[], &[])?, preferred);
+        let next = |offset| {
+            POOL_START
+                + (preferred - POOL_START + offset * RANGE_SIZE) % (POOL_END_EXCLUSIVE - POOL_START)
+        };
+        // Numeric and undecodable owners reserve space but do not identify alice.
+        let numeric = entry("1234567", preferred, RANGE_SIZE);
+        let unknown = Entry {
+            owner: None,
+            ..numeric.clone()
+        };
+        for (uids, gids, expected) in [
+            (vec![], vec![], preferred),
+            (vec![numeric.clone()], vec![], next(1)),
+            (vec![], vec![unknown.clone()], next(1)),
+            (
+                vec![numeric],
+                vec![Entry {
+                    start: next(1),
+                    ..unknown
+                }],
+                next(3),
+            ),
+        ] {
+            assert_eq!(
+                plan(&uids, &gids)?,
+                [
+                    (SubidFile::Uid, expected, RANGE_SIZE),
+                    (SubidFile::Gid, expected, RANGE_SIZE)
+                ]
+            );
+        }
+        assert_error(
+            plan(
+                &[entry("other", POOL_START, POOL_END_EXCLUSIVE - POOL_START)],
+                &[],
+            ),
+            "pool exhausted",
         );
         Ok(())
     }
 
     #[test]
-    fn plan_subid_updates_repairs_missing_uid_with_existing_gid_range() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [entry("other", POOL_START + RANGE_SIZE * 4, RANGE_SIZE)];
-        let subgid_entries = [entry("alice", POOL_START, RANGE_SIZE)];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert_eq!(
-            updates,
-            vec![PlannedEntry {
-                file: SubidFile::Uid,
-                start: POOL_START,
-                count: RANGE_SIZE,
-            }]
-        );
+    fn configured_pairs_are_left_unchanged() -> Result<()> {
+        for (uids, gids) in [
+            (
+                vec![entry("alice", POOL_START, RANGE_SIZE)],
+                vec![entry("alias", POOL_START + RANGE_SIZE, RANGE_SIZE)],
+            ),
+            (
+                vec![entry("alice", 100, 1), entry("alias", 200, 2)],
+                vec![entry("alice", 300, 3), entry("alias", 400, 4)],
+            ),
+            (
+                vec![entry("alice", 200_000_000, RANGE_SIZE * 2)],
+                vec![entry("alice", 300_000_000, 1)],
+            ),
+        ] {
+            assert!(plan(&uids, &gids)?.is_empty());
+        }
         Ok(())
     }
 
     #[test]
-    fn plan_subid_updates_skips_one_sided_single_range_that_exceeds_slot_size() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [entry("alice", POOL_START, RANGE_SIZE + 1)];
-        let subgid_entries = [entry("other", POOL_START + RANGE_SIZE * 4, RANGE_SIZE)];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert!(updates.is_empty());
+    fn one_sided_ranges_are_mirrored_in_either_direction() -> Result<()> {
+        for ranges in [
+            vec![("alice", POOL_START, RANGE_SIZE)],
+            vec![
+                ("alice", POOL_START, RANGE_SIZE),
+                ("alice", POOL_START + RANGE_SIZE * 2, RANGE_SIZE),
+            ],
+            // Legacy ranges may be unaligned/outside the pool and total more than one slot.
+            vec![
+                ("alias", 200_000_001, RANGE_SIZE),
+                ("alice", 200_200_001, 1),
+            ],
+        ] {
+            let mut source: Vec<_> = ranges
+                .iter()
+                .map(|&(owner, start, count)| entry(owner, start, count))
+                .collect();
+            source.push(entry("other", 100, 1));
+            let target = [entry("other", POOL_START + RANGE_SIZE * 5, RANGE_SIZE)];
+            for (uids, gids, file) in [
+                (&source[..], &target[..], SubidFile::Gid),
+                (&target[..], &source[..], SubidFile::Uid),
+            ] {
+                let expected: Vec<_> = ranges
+                    .iter()
+                    .map(|&(_, start, count)| (file, start, count))
+                    .collect();
+                assert_eq!(plan(uids, gids)?, expected);
+            }
+        }
         Ok(())
     }
 
     #[test]
-    fn plan_subid_updates_skips_one_sided_multiple_ranges_when_any_exceeds_slot_size() -> Result<()>
-    {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [
-            entry("alice", POOL_START, RANGE_SIZE),
-            entry("alice", POOL_START + RANGE_SIZE * 2, RANGE_SIZE + 1),
-        ];
-        let subgid_entries = [entry("other", POOL_START + RANGE_SIZE * 4, RANGE_SIZE)];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert!(updates.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn plan_subid_updates_skips_single_range_mirror_when_target_range_is_taken() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [entry("alice", POOL_START, RANGE_SIZE)];
-        let subgid_entries = [entry("other", POOL_START, RANGE_SIZE)];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert!(updates.is_empty());
-
-        Ok(())
-    }
-
-    #[test]
-    fn plan_subid_updates_skips_multiple_range_mirror_when_any_target_range_is_taken() -> Result<()>
-    {
-        let account = account("alice", 1_234_567, 1_234_567);
-        let subuid_entries = [
-            entry("alice", POOL_START, RANGE_SIZE),
-            entry("alice", POOL_START + RANGE_SIZE * 2, RANGE_SIZE),
-        ];
-        let subgid_entries = [entry("other", POOL_START + RANGE_SIZE * 2, RANGE_SIZE)];
-
-        let updates = plan_subid_updates(&account, "alice", &subuid_entries, &subgid_entries)?;
-
-        assert!(updates.is_empty());
-
-        Ok(())
-    }
-
-    #[test]
-    fn plan_subid_updates_allocates_same_new_range_for_uid_and_gid() -> Result<()> {
-        let account = account("alice", 1_234_567, 1_234_567);
-
-        let updates = plan_subid_updates(&account, "alice", &[], &[])?;
-
-        assert_eq!(updates.len(), 2);
-        assert_eq!(updates[0].file, SubidFile::Uid);
-        assert_eq!(updates[1].file, SubidFile::Gid);
-        assert_eq!(updates[0].start, updates[1].start);
-        assert_eq!(updates[0].count, RANGE_SIZE);
-        assert_eq!(updates[1].count, RANGE_SIZE);
-
-        Ok(())
+    fn unrepairable_ranges_fail_without_planning_partial_repairs() {
+        for (source, target, reason) in [
+            (
+                vec![entry("alice", POOL_START, RANGE_SIZE + 1)],
+                vec![],
+                "exceeds",
+            ),
+            (
+                vec![
+                    entry("alice", POOL_START, RANGE_SIZE),
+                    entry("alice", POOL_START + RANGE_SIZE * 2, RANGE_SIZE + 1),
+                ],
+                vec![],
+                "exceeds",
+            ),
+            (
+                vec![entry("alice", POOL_START, RANGE_SIZE)],
+                vec![entry("other", POOL_START, RANGE_SIZE)],
+                "overlaps",
+            ),
+            (
+                vec![
+                    entry("alice", POOL_START, RANGE_SIZE),
+                    entry("alice", POOL_START + RANGE_SIZE * 2, RANGE_SIZE),
+                ],
+                vec![entry("other", POOL_START + RANGE_SIZE * 2 + 1, 1)],
+                "overlaps",
+            ),
+        ] {
+            for (uids, gids, missing) in [
+                (&source, &target, "/etc/subgid"),
+                (&target, &source, "/etc/subuid"),
+            ] {
+                let error = plan(uids, gids).unwrap_err().to_string();
+                assert!(error.contains(missing) && error.contains(reason), "{error}");
+            }
+        }
     }
 }

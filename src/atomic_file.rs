@@ -6,8 +6,6 @@ use std::{
         io::AsRawFd,
     },
     path::Path,
-    process,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::error::{boxed, Result};
@@ -24,7 +22,7 @@ pub(crate) fn ensure_regular_file(path: &Path, mode: u32) -> Result<()> {
                 .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
                 .open(path)?;
 
-            set_file_mode(&file, mode)?;
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
             file.sync_all()?;
             sync_parent_directory(path)?;
             Ok(())
@@ -47,55 +45,37 @@ pub(crate) fn read_regular_file(path: &Path) -> Result<Vec<u8>> {
  * full read-parse-plan-replace transaction.
  */
 pub(crate) fn atomic_replace_locked(path: &Path, contents: &[u8]) -> Result<()> {
-    let existing = open_regular_file(path)?;
-    let meta = existing.metadata()?;
+    let meta = open_regular_file(path)?.metadata()?;
 
     let parent = path
         .parent()
         .ok_or_else(|| boxed(format!("no parent directory for {}", path.display())))?;
 
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| boxed(format!("no filename for {}", path.display())))?
-        .to_string_lossy();
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    let tmp_path = parent.join(format!(
-        ".{}.ensure-subid.{}.{}.tmp",
-        file_name,
-        process::id(),
-        now
-    ));
-
-    let mode = meta.permissions().mode() & 0o7777;
-    let uid = meta.uid();
-    let gid = meta.gid();
-
-    let write_result = write_temp_file(&tmp_path, contents, mode, uid, gid);
-
-    if let Err(e) = write_result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(e);
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    // SAFETY: temp owns the open descriptor; IDs come from the original file metadata.
+    let rc = unsafe { libc::fchown(temp.as_file().as_raw_fd(), meta.uid(), meta.gid()) };
+    if rc != 0 {
+        return Err(Box::new(io::Error::last_os_error()));
     }
 
-    if let Err(e) = fs::rename(&tmp_path, path) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(Box::new(e));
-    }
-
-    sync_directory(parent)?;
-
+    temp.write_all(contents)?;
+    // chown and writes can clear mode bits; restore them before publishing.
+    temp.as_file().set_permissions(fs::Permissions::from_mode(
+        meta.permissions().mode() & 0o7777,
+    ))?;
+    temp.as_file().sync_all()?;
+    // Drop the staging file immediately on failure, retaining only the I/O error.
+    temp.persist(path).map_err(|e| e.error)?;
+    sync_parent_directory(path)?;
     Ok(())
 }
 
-fn open_regular_file(path: &Path) -> io::Result<File> {
+pub(crate) fn open_regular_file(path: &Path) -> io::Result<File> {
+    // A FIFO must not block in open() before we can inspect the descriptor.
+    // O_NONBLOCK has no effect on regular-file I/O on Linux.
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .map_err(|e| map_open_error(path, e))?;
 
@@ -118,219 +98,88 @@ fn map_open_error(path: &Path, e: io::Error) -> io::Error {
     e
 }
 
-fn write_temp_file(path: &Path, contents: &[u8], mode: u32, uid: u32, gid: u32) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(mode)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(path)?;
-
-    // SAFETY: file.as_raw_fd() is a valid open file descriptor for file's
-    // lifetime. uid and gid were read from filesystem metadata.
-    let rc = unsafe { libc::fchown(file.as_raw_fd(), uid as libc::uid_t, gid as libc::gid_t) };
-    if rc != 0 {
-        return Err(Box::new(io::Error::last_os_error()));
-    }
-
-    set_file_mode(&file, mode)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-
-    Ok(())
-}
-
-fn set_file_mode(file: &File, mode: u32) -> Result<()> {
-    file.set_permissions(fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-
-fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let dir = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY)
-        .open(path)?;
+        .open(parent)?;
 
-    dir.sync_all()?;
-    Ok(())
-}
-
-fn sync_parent_directory(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| boxed(format!("no parent directory for {}", path.display())))?;
-
-    sync_directory(parent)
+    dir.sync_all()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, os::unix::fs::symlink, path::PathBuf, sync::Mutex};
+    use crate::test_support::{assert_error, isolated, make_fifo};
+    use std::os::unix::fs::symlink;
 
-    static UMASK_LOCK: Mutex<()> = Mutex::new(());
+    #[test]
+    fn regular_file_lifecycle_preserves_metadata_under_umask() -> Result<()> {
+        isolated(
+            "atomic_file::tests::regular_file_lifecycle_preserves_metadata_under_umask",
+            || {
+                let dir = tempfile::tempdir()?;
+                let path = dir.path().join("data");
+                // SAFETY: this child runs one test; no other tests share its umask.
+                unsafe {
+                    libc::umask(0o077);
+                }
+                ensure_regular_file(&path, 0o644)?;
+                assert_eq!(fs::metadata(&path)?.mode() & 0o7777, 0o644);
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+                ensure_regular_file(&path, 0o644)?;
+                assert_eq!(fs::metadata(&path)?.mode() & 0o7777, 0o600);
 
-    struct TestDir {
-        path: PathBuf,
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.path);
-        }
-    }
-
-    struct UmaskGuard {
-        old: libc::mode_t,
-    }
-
-    impl UmaskGuard {
-        fn set(mask: libc::mode_t) -> Self {
-            Self {
-                // SAFETY: umask has no pointer arguments. Tests serialize
-                // calls with UMASK_LOCK because umask is process-global.
-                old: unsafe { libc::umask(mask) },
-            }
-        }
-    }
-
-    impl Drop for UmaskGuard {
-        fn drop(&mut self) {
-            // SAFETY: umask has no pointer arguments. Tests serialize calls
-            // with UMASK_LOCK because umask is process-global.
-            unsafe {
-                libc::umask(self.old);
-            }
-        }
-    }
-
-    fn test_dir(name: &str) -> Result<TestDir> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = env::temp_dir().join(format!("ensure-subid-{name}-{}-{now}", process::id()));
-
-        fs::create_dir(&path)?;
-        Ok(TestDir { path })
-    }
-
-    fn mode(path: &Path) -> Result<u32> {
-        Ok(fs::metadata(path)?.permissions().mode() & 0o7777)
-    }
-
-    fn assert_error_contains(result: Result<()>, needle: &str) {
-        let error = result.expect_err("expected an error");
-        assert!(
-            error.to_string().contains(needle),
-            "expected error to contain {needle:?}, got {error}"
-        );
+                // As root, also exercise preservation of a different owner/group.
+                // SAFETY: geteuid has no arguments; file owns the fchown descriptor.
+                if unsafe { libc::geteuid() } == 0 {
+                    let file = File::open(&path)?;
+                    assert_eq!(unsafe { libc::fchown(file.as_raw_fd(), 65534, 65534) }, 0);
+                }
+                let original = fs::metadata(&path)?;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o6750))?;
+                atomic_replace_locked(&path, b"replacement")?;
+                assert_eq!(read_regular_file(&path)?, b"replacement");
+                let updated = fs::metadata(&path)?;
+                assert_eq!(
+                    (updated.uid(), updated.gid()),
+                    (original.uid(), original.gid())
+                );
+                assert_eq!(updated.mode() & 0o7777, 0o6750);
+                Ok(())
+            },
+        )
     }
 
     #[test]
-    fn ensure_regular_file_preserves_mode_despite_umask() -> Result<()> {
-        let dir = test_dir("ensure-regular-file-mode")?;
-        let path = dir.path.join("data");
-        let _lock = UMASK_LOCK.lock().unwrap();
-        let _umask = UmaskGuard::set(0o077);
+    fn file_operations_refuse_symlinks_directories_and_fifos() -> Result<()> {
+        isolated(
+            "atomic_file::tests::file_operations_refuse_symlinks_directories_and_fifos",
+            || {
+                let dir = tempfile::tempdir()?;
+                let target = dir.path().join("target");
+                let link = dir.path().join("link");
+                let fifo = dir.path().join("fifo");
+                fs::write(&target, b"original")?;
+                symlink(&target, &link)?;
+                make_fifo(&fifo)?;
 
-        ensure_regular_file(&path, 0o644)?;
-
-        let mode = fs::metadata(path)?.permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o644);
-
-        Ok(())
-    }
-
-    #[test]
-    fn ensure_regular_file_leaves_existing_file_mode_unchanged() -> Result<()> {
-        let dir = test_dir("ensure-existing-file-mode")?;
-        let path = dir.path.join("data");
-        fs::write(&path, "")?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-
-        ensure_regular_file(&path, 0o644)?;
-
-        assert_eq!(mode(&path)?, 0o600);
-        Ok(())
-    }
-
-    #[test]
-    fn ensure_regular_file_refuses_symlink_and_directory() -> Result<()> {
-        let dir = test_dir("ensure-refuses-unsafe-paths")?;
-        let target = dir.path.join("target");
-        let link = dir.path.join("link");
-        let child_dir = dir.path.join("child-dir");
-
-        fs::write(&target, "")?;
-        symlink(&target, &link)?;
-        fs::create_dir(&child_dir)?;
-
-        assert_error_contains(ensure_regular_file(&link, 0o644), "refusing symlink");
-        assert_error_contains(ensure_regular_file(&child_dir, 0o644), "not a regular file");
-
-        Ok(())
-    }
-
-    #[test]
-    fn atomic_replace_replaces_contents_and_preserves_mode_despite_umask() -> Result<()> {
-        let dir = test_dir("atomic-replace-mode")?;
-        let path = dir.path.join("data");
-        fs::write(&path, "old")?;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
-
-        let _lock = UMASK_LOCK.lock().unwrap();
-        let _umask = UmaskGuard::set(0o077);
-        atomic_replace_locked(&path, b"replacement")?;
-
-        assert_eq!(fs::read(&path)?, b"replacement");
-        assert_eq!(mode(&path)?, 0o644);
-
-        let temp_files = fs::read_dir(&dir.path)?
-            .filter_map(std::result::Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains(".ensure-subid.")
-            })
-            .count();
-        assert_eq!(temp_files, 0);
-
-        Ok(())
-    }
-
-    #[test]
-    fn atomic_replace_refuses_symlink_and_leaves_target_unchanged() -> Result<()> {
-        let dir = test_dir("atomic-replace-symlink")?;
-        let target = dir.path.join("target");
-        let link = dir.path.join("link");
-
-        fs::write(&target, "original")?;
-        symlink(&target, &link)?;
-
-        assert_error_contains(
-            atomic_replace_locked(&link, b"replacement"),
-            "refusing symlink",
-        );
-        assert_eq!(fs::read_to_string(&target)?, "original");
-
-        Ok(())
-    }
-
-    #[test]
-    fn read_regular_file_refuses_directory() -> Result<()> {
-        let dir = test_dir("read-regular-file-refuses-directory")?;
-        let child_dir = dir.path.join("child-dir");
-        fs::create_dir(&child_dir)?;
-
-        let error = read_regular_file(&child_dir).expect_err("expected an error");
-        assert!(
-            error.to_string().contains("not a regular file")
-                || error.to_string().contains("Is a directory"),
-            "unexpected error: {error}"
-        );
-
-        Ok(())
+                for (path, reason) in [
+                    (link.as_path(), "refusing symlink"),
+                    (dir.path(), "not a regular file"),
+                    (fifo.as_path(), "not a regular file"),
+                ] {
+                    assert_error(ensure_regular_file(path, 0o644), reason);
+                    assert_error(read_regular_file(path), reason);
+                    assert_error(atomic_replace_locked(path, b"replacement"), reason);
+                }
+                assert_eq!(fs::read(&target)?, b"original");
+                Ok(())
+            },
+        )
     }
 }
