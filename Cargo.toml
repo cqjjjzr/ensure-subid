@@ -2,7 +2,22 @@
 name = "ensure-subid"
 version = "0.1.0"
 edition = "2021"
+authors = ["chariri <w@chariri.moe>"]
+license = "MIT"
+description = "PAM helper for provisioning subordinate UID/GID ranges for NSS users"
+readme = "README.md"
 
 [dependencies]
 libc = "0.2"
 tempfile = "3.27"
+
+[package.metadata.deb]
+license-file = ["LICENSE", "0"]
+section = "admin"
+extended-description = "Provisions paired /etc/subuid and /etc/subgid ranges for NSS-backed users at login. Configure pam_exec.so in the PAM session stack to enable it."
+# cargo-deb excludes libgcc from its auto-detected dependencies.
+depends = "$auto, libgcc-s1, libpam-modules"
+assets = [
+    ["target/release/ensure-subid", "usr/sbin/", "755"],
+    ["README.md", "usr/share/doc/ensure-subid/", "644"],
+]

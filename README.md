@@ -28,22 +28,33 @@ cargo build --release
 sudo install -o root -g root -m 0755 target/release/ensure-subid /usr/local/sbin/ensure-subid
 ```
 
+## Debian package
+
+On Debian 13 with Rust installed:
+
+```sh
+sudo apt install dpkg-dev liblzma-dev
+cargo install cargo-deb --locked
+cargo deb --locked
+sudo apt install ./target/debian/*.deb
+```
+
 ## Usage
 
 Add `ensure-subid` to the PAM session stack:
 
 ```text
 # Log errors to syslog without blocking login:
-session optional pam_exec.so type=open_session /usr/local/sbin/ensure-subid
+session optional pam_exec.so type=open_session /usr/sbin/ensure-subid
 
 # Fail the PAM session if provisioning fails:
-session required pam_exec.so type=open_session /usr/local/sbin/ensure-subid --strict
+session required pam_exec.so type=open_session /usr/sbin/ensure-subid --strict
 ```
 
 Run manually for a specific user (`PAM_USER` takes precedence when set):
 
 ```sh
-sudo /usr/local/sbin/ensure-subid alice --strict
+sudo /usr/sbin/ensure-subid alice --strict
 ```
 
 ## Test
